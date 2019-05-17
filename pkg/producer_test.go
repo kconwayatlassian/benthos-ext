@@ -19,14 +19,10 @@ func TestProducerPipelineError(t *testing.T) {
 
 	mgr := NewMockManager(ctrl)
 	pipelineInput := make(chan types.Transaction, 1)
-	pipelineOutput := make(chan types.Transaction, 1)
-	outputInput := make(chan types.Transaction, 1)
 	ctx := context.Background()
 	p := &BenthosProducer{
-		Manager:        mgr,
-		PipelineInput:  pipelineInput,
-		PipelineOutput: pipelineOutput,
-		OutputInput:    outputInput,
+		Manager:       mgr,
+		PipelineInput: pipelineInput,
 	}
 	event := map[string]interface{}{
 		"test": "value",
@@ -44,19 +40,6 @@ func TestProducerPipelineError(t *testing.T) {
 	}()
 	_, err := p.Produce(ctx, event)
 	require.Error(t, err)
-
-	mgr.EXPECT().AddMessageID(gomock.Any()).DoAndReturn(func(m types.Message) types.Message {
-		return &ServerlessMessage{
-			Message: m,
-			key:     fmt.Sprintf("%d", rand.Uint64()),
-		}
-	})
-	go func() {
-		in := <-pipelineInput
-		in.ResponseChan <- response.NewAck()
-	}()
-	_, err = p.Produce(ctx, event)
-	require.Error(t, err)
 }
 
 func TestProducerPipelineCancelled(t *testing.T) {
@@ -65,15 +48,11 @@ func TestProducerPipelineCancelled(t *testing.T) {
 
 	mgr := NewMockManager(ctrl)
 	pipelineInput := make(chan types.Transaction, 1)
-	pipelineOutput := make(chan types.Transaction, 1)
-	outputInput := make(chan types.Transaction, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	p := &BenthosProducer{
-		Manager:        mgr,
-		PipelineInput:  pipelineInput,
-		PipelineOutput: pipelineOutput,
-		OutputInput:    outputInput,
+		Manager:       mgr,
+		PipelineInput: pipelineInput,
 	}
 	event := map[string]interface{}{
 		"test": "value",
@@ -95,14 +74,10 @@ func TestProducerPipelineResult(t *testing.T) {
 
 	mgr := NewMockManager(ctrl)
 	pipelineInput := make(chan types.Transaction, 1)
-	pipelineOutput := make(chan types.Transaction, 1)
-	outputInput := make(chan types.Transaction, 1)
 	ctx := context.Background()
 	p := &BenthosProducer{
-		Manager:        mgr,
-		PipelineInput:  pipelineInput,
-		PipelineOutput: pipelineOutput,
-		OutputInput:    outputInput,
+		Manager:       mgr,
+		PipelineInput: pipelineInput,
 	}
 	event := map[string]interface{}{
 		"test": "value",
@@ -125,12 +100,8 @@ func TestProducerPipelineResult(t *testing.T) {
 	})
 
 	go func() {
-		<-pipelineInput
-		ackChan := make(chan types.Response, 1)
-		tResult := types.NewTransaction(nil, ackChan)
-		pipelineOutput <- tResult
-		out := <-outputInput
-		out.ResponseChan <- response.NewAck()
+		tx := <-pipelineInput
+		tx.ResponseChan <- response.NewAck()
 	}()
 	out, err := p.Produce(ctx, event)
 	require.NoError(t, err)

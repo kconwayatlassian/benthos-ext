@@ -12,7 +12,6 @@ import (
 	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/output"
 	"github.com/Jeffail/benthos/lib/pipeline"
-	"github.com/Jeffail/benthos/lib/response"
 	"github.com/Jeffail/benthos/lib/types"
 )
 
@@ -36,11 +35,6 @@ func NewProducer(conf *config.Type) (*BenthosProducer, error) {
 	// pipelineInput is the entry point to the pipeline for all events
 	// received by the Lambda.
 	var pipelineInput = make(chan types.Transaction, 1)
-	// pipelineOutput will be used to extract the final form of the event
-	// before shipping it to the output.
-	var pipelineOutput <-chan types.Transaction
-	// outputInput is the entry point to the output composite.
-	var outputInput = make(chan types.Transaction, 1)
 	// manager manages statefull resources like caches, rate limits, and system
 	// conditions that are shared across the entire runtime.
 	var mgr *ServerlessManager
@@ -76,8 +70,7 @@ func NewProducer(conf *config.Type) (*BenthosProducer, error) {
 	if err := pipelineLayer.Consume(pipelineInput); err != nil {
 		return nil, fmt.Errorf("failed to connect pipeline: %s", err.Error())
 	}
-	pipelineOutput = pipelineLayer.TransactionChan()
-	if err := outputLayer.Consume(outputInput); err != nil {
+	if err := outputLayer.Consume(pipelineLayer.TransactionChan()); err != nil {
 		return nil, fmt.Errorf("failed to connect output: %s", err.Error())
 	}
 	closeFn := func() error {
@@ -92,11 +85,9 @@ func NewProducer(conf *config.Type) (*BenthosProducer, error) {
 		return nil
 	}
 	return &BenthosProducer{
-		Manager:        mgr,
-		PipelineInput:  pipelineInput,
-		PipelineOutput: pipelineOutput,
-		OutputInput:    outputInput,
-		CloseFn:        closeFn,
+		Manager:       mgr,
+		PipelineInput: pipelineInput,
+		CloseFn:       closeFn,
 	}, nil
 }
 
@@ -109,14 +100,6 @@ type BenthosProducer struct {
 	// PipelineInput will be sent the raw message received from the call to
 	// Produce().
 	PipelineInput chan<- types.Transaction
-	// PipelineOutput will be read from if the PipelineInput transaction
-	// results in a non-error Result. The value read from this channel will
-	// be treated as the final version of the message to produce and may be
-	// any number of parts.
-	PipelineOutput <-chan types.Transaction
-	// OutputInput will be sent the final version of message before the Lambda
-	// returns.
-	OutputInput chan<- types.Transaction
 	// CloseFn will be called when the producer is closed. This is used to bind
 	// shutdown behavior for any long lived resources used to power the producer.
 	CloseFn func() error
@@ -140,48 +123,20 @@ func (p *BenthosProducer) Produce(ctx context.Context, in interface{}) (interfac
 	msg.Append(part)
 	msg = p.Manager.AddMessageID(msg)
 
-	// Run the message through the processor and check for errors.
-	pipelineErrChan := make(chan types.Response, 1)
+	resChan := make(chan types.Response, 1)
 	select {
-	case p.PipelineInput <- types.NewTransaction(msg, pipelineErrChan):
+	case p.PipelineInput <- types.NewTransaction(msg, resChan):
 	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-
-	var pipelineResult types.Transaction
-	select {
-	case res := <-pipelineErrChan:
-		if res.Error() != nil {
-			return nil, res.Error()
-		}
-		return nil, errors.New("unexpected pipeline response")
-	case <-ctx.Done():
-		return nil, ctx.Err()
-
-	// The pipeline only processes on input at a time which enables us to
-	// read from this single pipeline output without worrying about getting
-	// the wrong result due to concurrent processing. Other messages will be
-	// enqueued until we send the ACK to the pipeline output transaction.
-	case pipelineResult = <-p.PipelineOutput:
-		go func() {
-			pipelineResult.ResponseChan <- response.NewAck()
-		}()
-	}
-
-	outputErrorChan := make(chan types.Response, 1)
-	select {
-	case p.OutputInput <- types.NewTransaction(pipelineResult.Payload, outputErrorChan):
-	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, errors.New("request cancelled")
 	}
 
 	select {
-	case res := <-outputErrorChan:
+	case res := <-resChan:
 		if res.Error() != nil {
 			return nil, res.Error()
 		}
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, errors.New("request cancelled")
 	}
 
 	r, _ := p.Manager.GetMessageResponse(msg)
