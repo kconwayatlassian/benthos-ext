@@ -43,6 +43,9 @@ func makeRPCCall(t *testing.T, port string, payload []byte) ([]byte, error) {
 		}
 		if res.Error != nil {
 			t.Log(res.Error.Message)
+			for _, st := range res.Error.StackTrace {
+				t.Log(st.Path, st.Line, st.Label)
+			}
 			continue
 		}
 		return res.Payload, nil
@@ -98,6 +101,7 @@ func TestLambdaBroker(t *testing.T) {
 		output.NewConfig(),
 	)
 	conf.Output.Broker.Outputs[1].Type = output.TypeDrop
+	conf.Output.Broker.Outputs[0].Type = benthosx.TypeServerless
 	payload := []byte(`{"test":"value"}`)
 
 	h, closeFn, err := benthosx.NewLambdaHandler(&conf)

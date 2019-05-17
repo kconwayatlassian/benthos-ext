@@ -3,20 +3,27 @@ package benthosx
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math/rand"
 	"testing"
 
-	"github.com/Jeffail/benthos/lib/message"
 	"github.com/Jeffail/benthos/lib/response"
 	"github.com/Jeffail/benthos/lib/types"
+	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 )
 
 func TestProducerPipelineError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mgr := NewMockManager(ctrl)
 	pipelineInput := make(chan types.Transaction, 1)
 	pipelineOutput := make(chan types.Transaction, 1)
 	outputInput := make(chan types.Transaction, 1)
 	ctx := context.Background()
 	p := &BenthosProducer{
+		Manager:        mgr,
 		PipelineInput:  pipelineInput,
 		PipelineOutput: pipelineOutput,
 		OutputInput:    outputInput,
@@ -25,6 +32,12 @@ func TestProducerPipelineError(t *testing.T) {
 		"test": "value",
 	}
 
+	mgr.EXPECT().AddMessageID(gomock.Any()).DoAndReturn(func(m types.Message) types.Message {
+		return &ServerlessMessage{
+			Message: m,
+			key:     fmt.Sprintf("%d", rand.Uint64()),
+		}
+	})
 	go func() {
 		in := <-pipelineInput
 		in.ResponseChan <- response.NewError(errors.New("error"))
@@ -32,6 +45,12 @@ func TestProducerPipelineError(t *testing.T) {
 	_, err := p.Produce(ctx, event)
 	require.Error(t, err)
 
+	mgr.EXPECT().AddMessageID(gomock.Any()).DoAndReturn(func(m types.Message) types.Message {
+		return &ServerlessMessage{
+			Message: m,
+			key:     fmt.Sprintf("%d", rand.Uint64()),
+		}
+	})
 	go func() {
 		in := <-pipelineInput
 		in.ResponseChan <- response.NewAck()
@@ -41,12 +60,17 @@ func TestProducerPipelineError(t *testing.T) {
 }
 
 func TestProducerPipelineCancelled(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mgr := NewMockManager(ctrl)
 	pipelineInput := make(chan types.Transaction, 1)
 	pipelineOutput := make(chan types.Transaction, 1)
 	outputInput := make(chan types.Transaction, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	p := &BenthosProducer{
+		Manager:        mgr,
 		PipelineInput:  pipelineInput,
 		PipelineOutput: pipelineOutput,
 		OutputInput:    outputInput,
@@ -54,17 +78,28 @@ func TestProducerPipelineCancelled(t *testing.T) {
 	event := map[string]interface{}{
 		"test": "value",
 	}
+	mgr.EXPECT().AddMessageID(gomock.Any()).DoAndReturn(func(m types.Message) types.Message {
+		return &ServerlessMessage{
+			Message: m,
+			key:     fmt.Sprintf("%d", rand.Uint64()),
+		}
+	})
 
 	_, err := p.Produce(ctx, event)
 	require.Error(t, err)
 }
 
-func TestProducerPipelineSingleResult(t *testing.T) {
+func TestProducerPipelineResult(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mgr := NewMockManager(ctrl)
 	pipelineInput := make(chan types.Transaction, 1)
 	pipelineOutput := make(chan types.Transaction, 1)
 	outputInput := make(chan types.Transaction, 1)
 	ctx := context.Background()
 	p := &BenthosProducer{
+		Manager:        mgr,
 		PipelineInput:  pipelineInput,
 		PipelineOutput: pipelineOutput,
 		OutputInput:    outputInput,
@@ -72,67 +107,32 @@ func TestProducerPipelineSingleResult(t *testing.T) {
 	event := map[string]interface{}{
 		"test": "value",
 	}
-	result := message.New(nil)
-	part := message.NewPart(nil)
-	_ = part.SetJSON(map[string]interface{}{
-		"part": "one",
+	result := map[string]interface{}{
+		"test2": "value2",
+	}
+	messageID := fmt.Sprintf("%d", rand.Uint64())
+	mgr.EXPECT().AddMessageID(gomock.Any()).DoAndReturn(func(m types.Message) types.Message {
+		return &ServerlessMessage{
+			Message: m,
+			key:     messageID,
+		}
 	})
-	result.Append(part)
+	mgr.EXPECT().GetMessageResponse(gomock.Any()).DoAndReturn(func(m types.Message) (interface{}, bool) {
+		smsg, ok := m.(*ServerlessMessage)
+		require.True(t, ok)
+		require.Equal(t, messageID, smsg.key)
+		return result, true
+	})
 
 	go func() {
 		<-pipelineInput
 		ackChan := make(chan types.Response, 1)
-		tResult := types.NewTransaction(result, ackChan)
+		tResult := types.NewTransaction(nil, ackChan)
 		pipelineOutput <- tResult
 		out := <-outputInput
 		out.ResponseChan <- response.NewAck()
 	}()
 	out, err := p.Produce(ctx, event)
 	require.NoError(t, err)
-	expectedOut, _ := part.JSON()
-	require.Equal(t, expectedOut, out)
-}
-
-func TestProducerPipelineMultiResult(t *testing.T) {
-	pipelineInput := make(chan types.Transaction, 1)
-	pipelineOutput := make(chan types.Transaction, 1)
-	outputInput := make(chan types.Transaction, 1)
-	ctx := context.Background()
-	p := &BenthosProducer{
-		PipelineInput:  pipelineInput,
-		PipelineOutput: pipelineOutput,
-		OutputInput:    outputInput,
-	}
-	event := map[string]interface{}{
-		"test": "value",
-	}
-	result := message.New(nil)
-	part := message.NewPart(nil)
-	_ = part.SetJSON(map[string]interface{}{
-		"part": "one",
-	})
-	result.Append(part)
-	part2 := message.NewPart(nil)
-	_ = part2.SetJSON(map[string]interface{}{
-		"part": "two",
-	})
-	result.Append(part2)
-
-	go func() {
-		<-pipelineInput
-		ackChan := make(chan types.Response, 1)
-		tResult := types.NewTransaction(result, ackChan)
-		pipelineOutput <- tResult
-		out := <-outputInput
-		out.ResponseChan <- response.NewAck()
-	}()
-	out, err := p.Produce(ctx, event)
-	require.NoError(t, err)
-	expectedOut := make([]interface{}, 0, 2)
-	_ = result.Iter(func(_ int, p types.Part) error {
-		partOut, _ := p.JSON()
-		expectedOut = append(expectedOut, partOut)
-		return nil
-	})
-	require.Equal(t, expectedOut, out)
+	require.Equal(t, result, out)
 }

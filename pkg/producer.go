@@ -8,7 +8,6 @@ import (
 
 	"github.com/Jeffail/benthos/lib/config"
 	"github.com/Jeffail/benthos/lib/log"
-	"github.com/Jeffail/benthos/lib/manager"
 	"github.com/Jeffail/benthos/lib/message"
 	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/output"
@@ -44,11 +43,16 @@ func NewProducer(conf *config.Type) (*BenthosProducer, error) {
 	var outputInput = make(chan types.Transaction, 1)
 	// manager manages statefull resources like caches, rate limits, and system
 	// conditions that are shared across the entire runtime.
-	var mgr *manager.Type
+	var mgr *ServerlessManager
 
 	var err error
 
-	mgr, err = manager.New(conf.Manager, types.NoopMgr(), logger, stats)
+	// For compatibility we map the default output option to serverless.
+	if conf.Output.Type == output.TypeSTDOUT {
+		conf.Output.Type = TypeServerless
+	}
+
+	mgr, err = NewServerlessManager(conf.Manager, types.NoopMgr(), logger, stats)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create resource: %s", err.Error())
 	}
@@ -88,6 +92,7 @@ func NewProducer(conf *config.Type) (*BenthosProducer, error) {
 		return nil
 	}
 	return &BenthosProducer{
+		Manager:        mgr,
 		PipelineInput:  pipelineInput,
 		PipelineOutput: pipelineOutput,
 		OutputInput:    outputInput,
@@ -98,6 +103,9 @@ func NewProducer(conf *config.Type) (*BenthosProducer, error) {
 // BenthosProducer uses a set of Benthos transaction channels to coordinate
 // processing and outputting an event.
 type BenthosProducer struct {
+	// Manager is used to coordinate between the serverless_output and the
+	// function.
+	Manager Manager
 	// PipelineInput will be sent the raw message received from the call to
 	// Produce().
 	PipelineInput chan<- types.Transaction
@@ -124,12 +132,13 @@ func (p *BenthosProducer) Close() error {
 // went wrong. The input may be any type that can be marshaled to JSON.
 func (p *BenthosProducer) Produce(ctx context.Context, in interface{}) (interface{}, error) {
 	// Convert the raw input into a Benthos message.
-	msg := message.New(nil)
+	var msg types.Message = message.New(nil)
 	part := message.NewPart(nil)
 	if err := part.SetJSON(in); err != nil {
 		return nil, err
 	}
 	msg.Append(part)
+	msg = p.Manager.AddMessageID(msg)
 
 	// Run the message through the processor and check for errors.
 	pipelineErrChan := make(chan types.Response, 1)
@@ -175,25 +184,6 @@ func (p *BenthosProducer) Produce(ctx context.Context, in interface{}) (interfac
 		return nil, ctx.Err()
 	}
 
-	m := pipelineResult.Payload
-	if m.Len() == 1 {
-		jResult, err := m.Get(0).JSON()
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal json response: %s", err.Error())
-		}
-		return jResult, nil
-	}
-
-	var results []interface{}
-	if err := m.Iter(func(i int, p types.Part) error {
-		jResult, err := p.JSON()
-		if err != nil {
-			return fmt.Errorf("failed to marshal json response: %s", err.Error())
-		}
-		results = append(results, jResult)
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-	return results, nil
+	r, _ := p.Manager.GetMessageResponse(msg)
+	return r, nil
 }
