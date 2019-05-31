@@ -26,7 +26,7 @@
   version = "v1.4.0"
 
 [[projects]]
-  digest = "1:fbf166c6bff7ec329a258272c2c4bf69ccbb2750e1ca4e25b5b2001c7c3f1f6a"
+  digest = "1:9b319587a3bb2a0509cceb3e5f7b4005ba58297c2b56363924c6ac960b06a587"
   name = "github.com/Jeffail/benthos"
   packages = [
     "lib/api",
@@ -35,6 +35,7 @@
     "lib/buffer/parallel",
     "lib/buffer/single",
     "lib/cache",
+    "lib/condition",
     "lib/config",
     "lib/input",
     "lib/input/reader",
@@ -49,7 +50,6 @@
     "lib/output/writer",
     "lib/pipeline",
     "lib/processor",
-    "lib/processor/condition",
     "lib/ratelimit",
     "lib/response",
     "lib/stream",
@@ -67,8 +67,8 @@
     "lib/util/tls",
   ]
   pruneopts = "UT"
-  revision = "c0bc336076208fed07bc6657994343337a5b98b2"
-  version = "v1.17.0"
+  revision = "3c72578a2e97449c8aec367cb66c7a7ad1db8e9f"
+  version = "v2.2.2"
 
 [[projects]]
   digest = "1:d1cd92da0f5158106ae06db669d28c8b0bd22edce5924f388d33e0b7d6651239"
@@ -299,6 +299,14 @@
   version = "v6.15.2"
 
 [[projects]]
+  digest = "1:ec6f9bf5e274c833c911923c9193867f3f18788c461f76f05f62bb1510e0ae65"
+  name = "github.com/go-sql-driver/mysql"
+  packages = ["."]
+  pruneopts = "UT"
+  revision = "72cd26f257d44c1114970e19afddcd812016007e"
+  version = "v1.4.1"
+
+[[projects]]
   digest = "1:bed9d72d596f94e65fff37f4d6c01398074a6bb1c3f3ceff963516bd01db6ff5"
   name = "github.com/gofrs/uuid"
   packages = ["."]
@@ -388,6 +396,18 @@
   packages = ["."]
   pruneopts = "UT"
   revision = "c2b33e84"
+
+[[projects]]
+  digest = "1:bdd53b87de8185da386bae179c84d4848854c6870bacacf6a154fe63e2e750f7"
+  name = "github.com/lib/pq"
+  packages = [
+    ".",
+    "oid",
+    "scram",
+  ]
+  pruneopts = "UT"
+  revision = "bc6a3c0594130b1e34005880bc600b6d3f49fa7f"
+  version = "v1.1.1"
 
 [[projects]]
   branch = "master"
@@ -804,10 +824,11 @@
   version = "v0.4.0"
 
 [[projects]]
-  digest = "1:15b86ee56687b2b842431678dacd1050900cd5ea24a47fa908ac32ce540664b7"
+  digest = "1:9265d12c2ead1baca4d1c9843d2f4eb1f2b28d6941bc6276ac8f0f2d9e683f17"
   name = "google.golang.org/appengine"
   packages = [
     ".",
+    "cloudsql",
     "internal",
     "internal/app_identity",
     "internal/base",
@@ -887,6 +908,14 @@
   pruneopts = "UT"
   revision = "51d6538a90f86fe93ac480b35f37b2be17fef232"
   version = "v2.2.2"
+
+[[projects]]
+  branch = "v3"
+  digest = "1:e11e6a71536a7120d56ea0c0cbfb4cf2b24b328f3982e8d03ce6939f7fe8b14c"
+  name = "gopkg.in/yaml.v3"
+  packages = ["."]
+  pruneopts = "UT"
+  revision = "55513cacd4ae8b250e3a9084ab9d8c407b1ed618"
 
 [[projects]]
   digest = "1:f9c82cb97ba3dda4162a7780dd8657603aaf8e600c5f0bd7a3e8e96fad2b5c01"

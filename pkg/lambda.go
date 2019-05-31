@@ -4,26 +4,14 @@ import (
 	"context"
 
 	"github.com/Jeffail/benthos/lib/config"
-	"github.com/Jeffail/benthos/lib/output"
 	"github.com/aws/aws-lambda-go/lambda"
 )
-
-// FormatIdentity returns the input value unchanged.
-func FormatIdentity(v interface{}) (interface{}, error) {
-	return v, nil
-}
-
-// FormatStatic always returns the Benthos success message.
-func FormatStatic(v interface{}) (interface{}, error) {
-	return map[string]interface{}{"message": "request successful"}, nil
-}
 
 // LambdaFunc coordinates between a Producer and FormatFN to implement the
 // behavior that will run in Lambda. The HandleEvent method is compatible with
 // the lambda.NewHandler() method from the Go SDK for Lambda.
 type LambdaFunc struct {
 	Producer Producer
-	FormatFn FormatFn
 }
 
 // HandleEvent implements a function signature that is compatible with the Go
@@ -33,7 +21,7 @@ func (f *LambdaFunc) HandleEvent(ctx context.Context, in interface{}) (interface
 	if err != nil {
 		return nil, err
 	}
-	return f.FormatFn(out)
+	return out, nil
 }
 
 // NewLambdaFunc generates a LambdaFunc from a given Benthos configuratino.
@@ -66,12 +54,6 @@ func NewLambdaFunc(conf *config.Type) (*LambdaFunc, func() error, error) {
 	// would result in both a message being produced to Kinesis and the same
 	// message being returned to the Lambda caller.
 
-	var outputFormatter FormatFn = FormatStatic
-	conf, echo := replaceStdout(conf)
-	if echo {
-		outputFormatter = FormatIdentity
-	}
-
 	producer, err := NewProducer(conf)
 	if err != nil {
 		return nil, nil, err
@@ -79,7 +61,6 @@ func NewLambdaFunc(conf *config.Type) (*LambdaFunc, func() error, error) {
 
 	f := &LambdaFunc{
 		Producer: producer,
-		FormatFn: outputFormatter,
 	}
 	return f, producer.Close, nil
 }
@@ -92,40 +73,4 @@ func NewLambdaHandler(conf *config.Type) (lambda.Handler, func() error, error) {
 		return nil, nil, err
 	}
 	return lambda.NewHandler(f.HandleEvent), close, nil
-}
-
-// replaceStdout converts any instance of STDOUT output to
-// a drop. If any instance of STDOUT is found then the boolean
-// returns true to indicate that the configuration requests outputting
-// the processing result.
-func replaceStdout(conf *config.Type) (*config.Type, bool) {
-	var echo bool
-	if conf.Output.Type == output.TypeSTDOUT {
-		conf.Output.Type = output.TypeDrop
-		echo = true
-	}
-	if conf.Output.Type == output.TypeBroker {
-		conf.Output.Broker, echo = replaceBroker(conf.Output.Broker)
-	}
-	return conf, echo
-}
-
-// replaceBroker scans a broker configuration tree and replaces
-// all instances of STDOUT with DROP.
-func replaceBroker(conf output.BrokerConfig) (output.BrokerConfig, bool) {
-	var echo bool
-	for offset, out := range conf.Outputs {
-		if out.Type == output.TypeSTDOUT {
-			conf.Outputs[offset].Type = output.TypeDrop
-			echo = true
-		}
-		if out.Type == output.TypeBroker {
-			var echoBroker bool
-			conf.Outputs[offset].Broker, echoBroker = replaceBroker(out.Broker)
-			if echoBroker {
-				echo = true
-			}
-		}
-	}
-	return conf, echo
 }

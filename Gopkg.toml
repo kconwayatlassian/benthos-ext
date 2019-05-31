@@ -2,7 +2,7 @@
 
 [[constraint]]
   name = "github.com/Jeffail/benthos"
-  version = "1.16.0"
+  version = "2.2.0"
 
 [[constraint]]
   name = "gopkg.in/yaml.v2"

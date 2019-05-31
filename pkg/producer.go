@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/Jeffail/benthos/lib/config"
@@ -13,7 +14,6 @@ import (
 	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/output"
 	"github.com/Jeffail/benthos/lib/pipeline"
-	"github.com/Jeffail/benthos/lib/response"
 	"github.com/Jeffail/benthos/lib/types"
 )
 
@@ -21,12 +21,15 @@ import (
 // instance that may be used as either a client in other code or as input
 // for constructing a Lambda function.
 func NewProducer(conf *config.Type) (*BenthosProducer, error) {
-	// Disable logging in favor of creating our own logging decorator for
-	// the producer interface as needed.
-	logger := log.Noop()
-	// Disable metrics in favor of having our own metrics decorator for the
-	// producer interfaces as needed.
-	stats := metrics.Noop()
+	// Logging and stats aggregation.
+	logger := log.New(os.Stdout, conf.Logger)
+
+	// Create our metrics type.
+	stats, err := metrics.New(conf.Metrics, metrics.OptSetLogger(logger))
+	for err != nil {
+		logger.Errorf("Failed to connect metrics aggregator: %v\n", err)
+		stats = metrics.Noop()
+	}
 
 	// piplineLayer represents the processing pipeline that a message will
 	// pass through.
@@ -37,16 +40,14 @@ func NewProducer(conf *config.Type) (*BenthosProducer, error) {
 	// pipelineInput is the entry point to the pipeline for all events
 	// received by the Lambda.
 	var pipelineInput = make(chan types.Transaction, 1)
-	// pipelineOutput will be used to extract the final form of the event
-	// before shipping it to the output.
-	var pipelineOutput <-chan types.Transaction
-	// outputInput is the entry point to the output composite.
-	var outputInput = make(chan types.Transaction, 1)
 	// manager manages statefull resources like caches, rate limits, and system
 	// conditions that are shared across the entire runtime.
 	var mgr *manager.Type
 
-	var err error
+	// For compatibility we map the default output option to serverless.
+	if conf.Output.Type == output.TypeSTDOUT {
+		conf.Output.Type = TypeServerless
+	}
 
 	mgr, err = manager.New(conf.Manager, types.NoopMgr(), logger, stats)
 	if err != nil {
@@ -72,8 +73,7 @@ func NewProducer(conf *config.Type) (*BenthosProducer, error) {
 	if err := pipelineLayer.Consume(pipelineInput); err != nil {
 		return nil, fmt.Errorf("failed to connect pipeline: %s", err.Error())
 	}
-	pipelineOutput = pipelineLayer.TransactionChan()
-	if err := outputLayer.Consume(outputInput); err != nil {
+	if err := outputLayer.Consume(pipelineLayer.TransactionChan()); err != nil {
 		return nil, fmt.Errorf("failed to connect output: %s", err.Error())
 	}
 	closeFn := func() error {
@@ -88,10 +88,8 @@ func NewProducer(conf *config.Type) (*BenthosProducer, error) {
 		return nil
 	}
 	return &BenthosProducer{
-		PipelineInput:  pipelineInput,
-		PipelineOutput: pipelineOutput,
-		OutputInput:    outputInput,
-		CloseFn:        closeFn,
+		PipelineInput: pipelineInput,
+		CloseFn:       closeFn,
 	}, nil
 }
 
@@ -101,14 +99,6 @@ type BenthosProducer struct {
 	// PipelineInput will be sent the raw message received from the call to
 	// Produce().
 	PipelineInput chan<- types.Transaction
-	// PipelineOutput will be read from if the PipelineInput transaction
-	// results in a non-error Result. The value read from this channel will
-	// be treated as the final version of the message to produce and may be
-	// any number of parts.
-	PipelineOutput <-chan types.Transaction
-	// OutputInput will be sent the final version of message before the Lambda
-	// returns.
-	OutputInput chan<- types.Transaction
 	// CloseFn will be called when the producer is closed. This is used to bind
 	// shutdown behavior for any long lived resources used to power the producer.
 	CloseFn func() error
@@ -124,76 +114,96 @@ func (p *BenthosProducer) Close() error {
 // went wrong. The input may be any type that can be marshaled to JSON.
 func (p *BenthosProducer) Produce(ctx context.Context, in interface{}) (interface{}, error) {
 	// Convert the raw input into a Benthos message.
-	msg := message.New(nil)
+	var msg = message.New(nil)
 	part := message.NewPart(nil)
 	if err := part.SetJSON(in); err != nil {
 		return nil, err
 	}
-	msg.Append(part)
+	msgPart := message.WithContext(NewResponseContext(ctx), part)
+	msg.Append(msgPart)
 
-	// Run the message through the processor and check for errors.
-	pipelineErrChan := make(chan types.Response, 1)
+	resChan := make(chan types.Response, 1)
 	select {
-	case p.PipelineInput <- types.NewTransaction(msg, pipelineErrChan):
+	case p.PipelineInput <- types.NewTransaction(msg, resChan):
 	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-
-	var pipelineResult types.Transaction
-	select {
-	case res := <-pipelineErrChan:
-		if res.Error() != nil {
-			return nil, res.Error()
-		}
-		return nil, errors.New("unexpected pipeline response")
-	case <-ctx.Done():
-		return nil, ctx.Err()
-
-	// The pipeline only processes on input at a time which enables us to
-	// read from this single pipeline output without worrying about getting
-	// the wrong result due to concurrent processing. Other messages will be
-	// enqueued until we send the ACK to the pipeline output transaction.
-	case pipelineResult = <-p.PipelineOutput:
-		go func() {
-			pipelineResult.ResponseChan <- response.NewAck()
-		}()
-	}
-
-	outputErrorChan := make(chan types.Response, 1)
-	select {
-	case p.OutputInput <- types.NewTransaction(pipelineResult.Payload, outputErrorChan):
-	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, errors.New("request cancelled")
 	}
 
 	select {
-	case res := <-outputErrorChan:
+	case res := <-resChan:
 		if res.Error() != nil {
 			return nil, res.Error()
 		}
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, errors.New("request cancelled")
 	}
 
-	m := pipelineResult.Payload
-	if m.Len() == 1 {
-		jResult, err := m.Get(0).JSON()
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal json response: %s", err.Error())
-		}
-		return jResult, nil
+	r := ResponseFromContext(message.GetContext(msgPart))
+	if r.Len() == 0 {
+		// nothing set == no serverless outputs. use a canned response.
+		return map[string]interface{}{
+			"message": "request successful",
+		}, nil
 	}
-
-	var results []interface{}
-	if err := m.Iter(func(i int, p types.Part) error {
-		jResult, err := p.JSON()
-		if err != nil {
-			return fmt.Errorf("failed to marshal json response: %s", err.Error())
+	if r.Len() == 1 {
+		var responseMsgs []types.Message
+		r.Range(func(key string, response []types.Message) bool {
+			responseMsgs = response
+			return false
+		})
+		if len(responseMsgs) == 1 {
+			if responseMsgs[0].Len() == 1 {
+				// one key, one msg, one part == {}
+				return responseMsgs[0].Get(0).JSON()
+			}
+			if responseMsgs[0].Len() > 1 {
+				// one key, one msg, multi part == [{},...]
+				results := make([]interface{}, 0, responseMsgs[0].Len())
+				err := responseMsgs[0].Iter(func(_ int, p types.Part) error {
+					jResult, err := p.JSON()
+					results = append(results, jResult)
+					return err
+				})
+				return results, err
+			}
+			// one key, one msg, zero parts == ???
+			// TODO: Define this case.
+			return nil, nil
 		}
-		results = append(results, jResult)
-		return nil
-	}); err != nil {
-		return nil, err
+		// one key, multi message, any part == [[],[]]
+		results := make([][]interface{}, 0, len(responseMsgs))
+		for _, responseMsg := range responseMsgs {
+			msgParts := make([]interface{}, 0, responseMsg.Len())
+			if err := responseMsg.Iter(func(_ int, p types.Part) error {
+				jResult, err := p.JSON()
+				msgParts = append(msgParts, jResult)
+				return err
+			}); err != nil {
+				return nil, err
+			}
+			results = append(results, msgParts)
+		}
+		return results, nil
 	}
-	return results, nil
+	// multi-key, any msg, any part == {"k": [[]]}
+	results := make(map[string][][]interface{})
+	var err error // captures any JSON errors in the range function
+	r.Range(func(k string, msgs []types.Message) bool {
+		kResults := make([][]interface{}, 0, len(msgs))
+		for _, responseMsg := range msgs {
+			msgParts := make([]interface{}, 0, responseMsg.Len())
+			err = responseMsg.Iter(func(_ int, p types.Part) error {
+				jResult, er := p.JSON()
+				msgParts = append(msgParts, jResult)
+				return er
+			})
+			if err != nil {
+				return false
+			}
+			kResults = append(kResults, msgParts)
+		}
+		results[k] = kResults
+		return true
+	})
+	return results, err
 }

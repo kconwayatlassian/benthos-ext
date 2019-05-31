@@ -13,43 +13,29 @@ import (
 
 func TestProducerPipelineError(t *testing.T) {
 	pipelineInput := make(chan types.Transaction, 1)
-	pipelineOutput := make(chan types.Transaction, 1)
-	outputInput := make(chan types.Transaction, 1)
 	ctx := context.Background()
 	p := &BenthosProducer{
-		PipelineInput:  pipelineInput,
-		PipelineOutput: pipelineOutput,
-		OutputInput:    outputInput,
+		CloseFn:       func() error { return nil },
+		PipelineInput: pipelineInput,
 	}
 	event := map[string]interface{}{
 		"test": "value",
 	}
-
 	go func() {
 		in := <-pipelineInput
 		in.ResponseChan <- response.NewError(errors.New("error"))
 	}()
 	_, err := p.Produce(ctx, event)
 	require.Error(t, err)
-
-	go func() {
-		in := <-pipelineInput
-		in.ResponseChan <- response.NewAck()
-	}()
-	_, err = p.Produce(ctx, event)
-	require.Error(t, err)
 }
 
 func TestProducerPipelineCancelled(t *testing.T) {
 	pipelineInput := make(chan types.Transaction, 1)
-	pipelineOutput := make(chan types.Transaction, 1)
-	outputInput := make(chan types.Transaction, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	p := &BenthosProducer{
-		PipelineInput:  pipelineInput,
-		PipelineOutput: pipelineOutput,
-		OutputInput:    outputInput,
+		CloseFn:       func() error { return nil },
+		PipelineInput: pipelineInput,
 	}
 	event := map[string]interface{}{
 		"test": "value",
@@ -59,80 +45,114 @@ func TestProducerPipelineCancelled(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestProducerPipelineSingleResult(t *testing.T) {
+func TestProducerPipelineResult(t *testing.T) {
 	pipelineInput := make(chan types.Transaction, 1)
-	pipelineOutput := make(chan types.Transaction, 1)
-	outputInput := make(chan types.Transaction, 1)
-	ctx := context.Background()
-	p := &BenthosProducer{
-		PipelineInput:  pipelineInput,
-		PipelineOutput: pipelineOutput,
-		OutputInput:    outputInput,
+	testEvent := map[string]interface{}{
+		"key": "value",
 	}
-	event := map[string]interface{}{
-		"test": "value",
+	testCases := []struct {
+		name     string
+		m        *ResponseMap
+		expected interface{}
+	}{
+		{
+			name: "empty",
+			m:    &ResponseMap{},
+			expected: map[string]interface{}{
+				"message": "request successful",
+			},
+		},
+		{
+			name: "one key, one msg, one part",
+			m: func() *ResponseMap {
+				m := &ResponseMap{}
+				msg := message.New(nil)
+				part := message.NewPart(nil)
+				_ = part.SetJSON(testEvent)
+				msg.Append(part)
+				m.Append("", msg)
+				return m
+			}(),
+			expected: testEvent,
+		},
+		{
+			name: "one key, one msg, multi part",
+			m: func() *ResponseMap {
+				m := &ResponseMap{}
+				msg := message.New(nil)
+				part := message.NewPart(nil)
+				_ = part.SetJSON(testEvent)
+				msg.Append(part)
+				msg.Append(part)
+				m.Append("", msg)
+				return m
+			}(),
+			expected: []interface{}{testEvent, testEvent},
+		},
+		{
+			name: "one key, multi msg, any part",
+			m: func() *ResponseMap {
+				m := &ResponseMap{}
+				msg := message.New(nil)
+				part := message.NewPart(nil)
+				_ = part.SetJSON(testEvent)
+				msg.Append(part)
+				m.Append("", msg)
+				msg = message.New(nil)
+				msg.Append(part)
+				msg.Append(part)
+				m.Append("", msg)
+				return m
+			}(),
+			expected: [][]interface{}{
+				[]interface{}{testEvent},
+				[]interface{}{testEvent, testEvent},
+			},
+		},
+		{
+			name: "multi key, any msg, any part",
+			m: func() *ResponseMap {
+				m := &ResponseMap{}
+				msg := message.New(nil)
+				part := message.NewPart(nil)
+				_ = part.SetJSON(testEvent)
+				msg.Append(part)
+				m.Append("a", msg)
+				msg = message.New(nil)
+				msg.Append(part)
+				msg.Append(part)
+				m.Append("b", msg)
+				return m
+			}(),
+			expected: map[string][][]interface{}{
+				"a": [][]interface{}{
+					[]interface{}{testEvent},
+				},
+				"b": [][]interface{}{
+					[]interface{}{testEvent, testEvent},
+				},
+			},
+		},
 	}
-	result := message.New(nil)
-	part := message.NewPart(nil)
-	_ = part.SetJSON(map[string]interface{}{
-		"part": "one",
-	})
-	result.Append(part)
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx := context.Background()
+			ctx = context.WithValue(ctx, ctxKey, testCase.m)
+			p := &BenthosProducer{
+				CloseFn:       func() error { return nil },
+				PipelineInput: pipelineInput,
+			}
+			event := map[string]interface{}{
+				"test": "value",
+			}
+			go func() {
+				tx := <-pipelineInput
+				tx.ResponseChan <- response.NewAck()
+			}()
+			out, err := p.Produce(ctx, event)
+			require.NoError(t, err)
+			require.Equal(t, testCase.expected, out)
+		})
+	}
 
-	go func() {
-		<-pipelineInput
-		ackChan := make(chan types.Response, 1)
-		tResult := types.NewTransaction(result, ackChan)
-		pipelineOutput <- tResult
-		out := <-outputInput
-		out.ResponseChan <- response.NewAck()
-	}()
-	out, err := p.Produce(ctx, event)
-	require.NoError(t, err)
-	expectedOut, _ := part.JSON()
-	require.Equal(t, expectedOut, out)
-}
-
-func TestProducerPipelineMultiResult(t *testing.T) {
-	pipelineInput := make(chan types.Transaction, 1)
-	pipelineOutput := make(chan types.Transaction, 1)
-	outputInput := make(chan types.Transaction, 1)
-	ctx := context.Background()
-	p := &BenthosProducer{
-		PipelineInput:  pipelineInput,
-		PipelineOutput: pipelineOutput,
-		OutputInput:    outputInput,
-	}
-	event := map[string]interface{}{
-		"test": "value",
-	}
-	result := message.New(nil)
-	part := message.NewPart(nil)
-	_ = part.SetJSON(map[string]interface{}{
-		"part": "one",
-	})
-	result.Append(part)
-	part2 := message.NewPart(nil)
-	_ = part2.SetJSON(map[string]interface{}{
-		"part": "two",
-	})
-	result.Append(part2)
-
-	go func() {
-		<-pipelineInput
-		ackChan := make(chan types.Response, 1)
-		tResult := types.NewTransaction(result, ackChan)
-		pipelineOutput <- tResult
-		out := <-outputInput
-		out.ResponseChan <- response.NewAck()
-	}()
-	out, err := p.Produce(ctx, event)
-	require.NoError(t, err)
-	expectedOut := make([]interface{}, 0, 2)
-	_ = result.Iter(func(_ int, p types.Part) error {
-		partOut, _ := p.JSON()
-		expectedOut = append(expectedOut, partOut)
-		return nil
-	})
-	require.Equal(t, expectedOut, out)
 }
