@@ -1,11 +1,11 @@
 package benthosx
 
 import (
-	"fmt"
 	"sync"
 	"time"
 
 	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/message"
 	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/output"
 	"github.com/Jeffail/benthos/lib/response"
@@ -21,11 +21,13 @@ func init() {
 	output.RegisterPlugin(
 		"serverless_response",
 		func() interface{} {
-			conf := NewServerlessResponseConfig()
-			return &conf
+			return NewServerlessResponseConfig()
 		},
 		func(iconf interface{}, mgr types.Manager, logger log.Modular, stats metrics.Type) (types.Output, error) {
-			return NewServerlessResponse(mgr, logger, stats)
+			if iconf == nil {
+				iconf = NewServerlessResponseConfig()
+			}
+			return NewServerlessResponse(iconf.(ServerlessResponseConfig), mgr, logger, stats)
 		},
 	)
 
@@ -41,6 +43,7 @@ message value from the function.`,
 // ServerlessResponseConfig contains configuration fields for the
 // ServerlessResponse output.
 type ServerlessResponseConfig struct {
+	Name string
 }
 
 // NewServerlessResponseConfig returns a ServerlessResponseConfig with
@@ -61,19 +64,22 @@ type ServerlessResponse struct {
 	closeOnce  sync.Once
 	closeChan  chan struct{}
 	closedChan chan struct{}
+
+	name string
 }
 
 // NewServerlessResponse creates a new plugin output type.
 func NewServerlessResponse(
+	conf ServerlessResponseConfig,
 	mgr types.Manager,
 	log log.Modular,
 	stats metrics.Type,
 ) (output.Type, error) {
 	e := &ServerlessResponse{
-		mgr:   mgr,
-		log:   log,
-		stats: stats,
-
+		mgr:        mgr,
+		log:        log,
+		stats:      stats,
+		name:       conf.Name,
 		closeChan:  make(chan struct{}),
 		closedChan: make(chan struct{}),
 	}
@@ -100,41 +106,8 @@ func (e *ServerlessResponse) loop() {
 			return
 		}
 
-		var result interface{}
-		if tran.Payload.Len() == 1 {
-			intermediateResults, err := tran.Payload.Get(0).JSON()
-			if err != nil {
-				tran.ResponseChan <- response.NewError(
-					fmt.Errorf("serverless_response only supports json: %v", err),
-				)
-				continue
-			}
-			result = intermediateResults
-		}
-		if tran.Payload.Len() > 1 {
-			intermediateResults := make([]interface{}, 0, tran.Payload.Len())
-			if err := tran.Payload.Iter(func(_ int, p types.Part) error {
-				jResult, err := p.JSON()
-				if err != nil {
-					return fmt.Errorf("failed to marshal json response: %s", err.Error())
-				}
-				intermediateResults = append(intermediateResults, jResult)
-				return nil
-			}); err != nil {
-				tran.ResponseChan <- response.NewError(
-					fmt.Errorf("serverless_response only supports json: %v", err),
-				)
-				continue
-			}
-			result = intermediateResults
-		}
-		// TODO: stop converting if/when these features are contributed to
-		// Benthos.
-		if err := e.mgr.(*ServerlessManager).SetMessageResponse(tran.Payload, result); err != nil {
-			tran.ResponseChan <- response.NewError(
-				fmt.Errorf("serverless_response could not track the response: %v", err),
-			)
-			continue
+		if tran.Payload.Len() > 0 {
+			ResponseFromContext(message.GetContext(tran.Payload.Get(0))).Append(e.name, tran.Payload)
 		}
 
 		select {

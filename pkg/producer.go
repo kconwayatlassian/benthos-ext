@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/Jeffail/benthos/lib/config"
 	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/manager"
 	"github.com/Jeffail/benthos/lib/message"
 	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/output"
@@ -19,12 +21,15 @@ import (
 // instance that may be used as either a client in other code or as input
 // for constructing a Lambda function.
 func NewProducer(conf *config.Type) (*BenthosProducer, error) {
-	// Disable logging in favor of creating our own logging decorator for
-	// the producer interface as needed.
-	logger := log.Noop()
-	// Disable metrics in favor of having our own metrics decorator for the
-	// producer interfaces as needed.
-	stats := metrics.Noop()
+	// Logging and stats aggregation.
+	logger := log.New(os.Stdout, conf.Logger)
+
+	// Create our metrics type.
+	stats, err := metrics.New(conf.Metrics, metrics.OptSetLogger(logger))
+	for err != nil {
+		logger.Errorf("Failed to connect metrics aggregator: %v\n", err)
+		stats = metrics.Noop()
+	}
 
 	// piplineLayer represents the processing pipeline that a message will
 	// pass through.
@@ -37,16 +42,14 @@ func NewProducer(conf *config.Type) (*BenthosProducer, error) {
 	var pipelineInput = make(chan types.Transaction, 1)
 	// manager manages statefull resources like caches, rate limits, and system
 	// conditions that are shared across the entire runtime.
-	var mgr *ServerlessManager
-
-	var err error
+	var mgr *manager.Type
 
 	// For compatibility we map the default output option to serverless.
 	if conf.Output.Type == output.TypeSTDOUT {
 		conf.Output.Type = TypeServerless
 	}
 
-	mgr, err = NewServerlessManager(conf.Manager, types.NoopMgr(), logger, stats)
+	mgr, err = manager.New(conf.Manager, types.NoopMgr(), logger, stats)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create resource: %s", err.Error())
 	}
@@ -85,7 +88,6 @@ func NewProducer(conf *config.Type) (*BenthosProducer, error) {
 		return nil
 	}
 	return &BenthosProducer{
-		Manager:       mgr,
 		PipelineInput: pipelineInput,
 		CloseFn:       closeFn,
 	}, nil
@@ -94,9 +96,6 @@ func NewProducer(conf *config.Type) (*BenthosProducer, error) {
 // BenthosProducer uses a set of Benthos transaction channels to coordinate
 // processing and outputting an event.
 type BenthosProducer struct {
-	// Manager is used to coordinate between the serverless_output and the
-	// function.
-	Manager Manager
 	// PipelineInput will be sent the raw message received from the call to
 	// Produce().
 	PipelineInput chan<- types.Transaction
@@ -115,13 +114,13 @@ func (p *BenthosProducer) Close() error {
 // went wrong. The input may be any type that can be marshaled to JSON.
 func (p *BenthosProducer) Produce(ctx context.Context, in interface{}) (interface{}, error) {
 	// Convert the raw input into a Benthos message.
-	var msg types.Message = message.New(nil)
+	var msg = message.New(nil)
 	part := message.NewPart(nil)
 	if err := part.SetJSON(in); err != nil {
 		return nil, err
 	}
-	msg.Append(part)
-	msg = p.Manager.AddMessageID(msg)
+	msgPart := message.WithContext(NewResponseContext(ctx), part)
+	msg.Append(msgPart)
 
 	resChan := make(chan types.Response, 1)
 	select {
@@ -139,6 +138,72 @@ func (p *BenthosProducer) Produce(ctx context.Context, in interface{}) (interfac
 		return nil, errors.New("request cancelled")
 	}
 
-	r, _ := p.Manager.GetMessageResponse(msg)
-	return r, nil
+	r := ResponseFromContext(message.GetContext(msgPart))
+	if r.Len() == 0 {
+		// nothing set == no serverless outputs. use a canned response.
+		return map[string]interface{}{
+			"message": "request successful",
+		}, nil
+	}
+	if r.Len() == 1 {
+		var responseMsgs []types.Message
+		r.Range(func(key string, response []types.Message) bool {
+			responseMsgs = response
+			return false
+		})
+		if len(responseMsgs) == 1 {
+			if responseMsgs[0].Len() == 1 {
+				// one key, one msg, one part == {}
+				return responseMsgs[0].Get(0).JSON()
+			}
+			if responseMsgs[0].Len() > 1 {
+				// one key, one msg, multi part == [{},...]
+				results := make([]interface{}, 0, responseMsgs[0].Len())
+				err := responseMsgs[0].Iter(func(_ int, p types.Part) error {
+					jResult, err := p.JSON()
+					results = append(results, jResult)
+					return err
+				})
+				return results, err
+			}
+			// one key, one msg, zero parts == ???
+			// TODO: Define this case.
+			return nil, nil
+		}
+		// one key, multi message, any part == [[],[]]
+		results := make([][]interface{}, 0, len(responseMsgs))
+		for _, responseMsg := range responseMsgs {
+			msgParts := make([]interface{}, 0, responseMsg.Len())
+			if err := responseMsg.Iter(func(_ int, p types.Part) error {
+				jResult, err := p.JSON()
+				msgParts = append(msgParts, jResult)
+				return err
+			}); err != nil {
+				return nil, err
+			}
+			results = append(results, msgParts)
+		}
+		return results, nil
+	}
+	// multi-key, any msg, any part == {"k": [[]]}
+	results := make(map[string][][]interface{})
+	var err error // captures any JSON errors in the range function
+	r.Range(func(k string, msgs []types.Message) bool {
+		kResults := make([][]interface{}, 0, len(msgs))
+		for _, responseMsg := range msgs {
+			msgParts := make([]interface{}, 0, responseMsg.Len())
+			err = responseMsg.Iter(func(_ int, p types.Part) error {
+				jResult, er := p.JSON()
+				msgParts = append(msgParts, jResult)
+				return er
+			})
+			if err != nil {
+				return false
+			}
+			kResults = append(kResults, msgParts)
+		}
+		results[k] = kResults
+		return true
+	})
+	return results, err
 }
